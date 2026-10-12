@@ -84,12 +84,11 @@ pub async fn detect_service_manager() -> Option<ServiceManager> {
     }
 
     // Check OpenWrt / sysv init.d
-    for script in &["/etc/init.d/zapret2"] {
-        if std::path::Path::new(script).exists() {
-            return Some(ServiceManager::InitD {
-                script: script.to_string(),
-            });
-        }
+    let script = "/etc/init.d/zapret2";
+    if std::path::Path::new(script).exists() {
+        return Some(ServiceManager::InitD {
+            script: script.to_string(),
+        });
     }
 
     None

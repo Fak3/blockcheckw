@@ -178,8 +178,8 @@ impl SystemNfqws2 {
         Err(Error::QueueBusy { queue: last_queue })
     }
 
-    /// Единственное место, где мы вообще ВИДИМ stderr движка: боевой путь шлёт
-    /// его в /dev/null, и причина отказа иначе не видна никогда.
+    /// Здесь stderr классифицируется (`classify_stderr`): отказ по lua или по
+    /// `--filter-mark` превращается в понятную человеку ошибку ещё до скана.
     fn smoke_on_queue(env: &Env, witness: &FilterMark, queue: QueueNum) -> Result<(), Error> {
         // Занята ли очередь ДО нашего спавна. `queue_bound` отвечает «занята
         // кем-то», не «занята нами» — если там уже сидит орфан прошлого
@@ -196,10 +196,9 @@ impl SystemNfqws2 {
         let plan = Plan::from_strategies(witness, queue, &[Vec::new()]);
         let argv = plan.argv(env);
         // Спавним напрямую через std::process, не через BackgroundProcess::spawn:
-        // тот регистрирует ребёнка в общем реестре ради shutdown-хуков, но
-        // жёстко шлёт его stdout/stderr в /dev/null. Перехват stderr — это
-        // весь смысл smoke_sync (см. doc-комментарий метода), так что цена
-        // мимо реестра здесь осознанная: этот ребёнок недолговечен и снимается
+        // тот асинхронный (tokio-ребёнок и вычерпывающая задача), а smoke_sync
+        // синхронен на всю цепочку вызова (см. `probe_sync`). Цена мимо реестра
+        // shutdown-хуков осознанная: этот ребёнок недолговечен и снимается
         // самим smoke_sync (kill+wait ниже) до возврата из функции.
         let mut smoke = std::process::Command::new(&argv[0]);
         smoke
@@ -332,9 +331,7 @@ impl SystemNfqws2 {
             if let Some(code) = instance.process.try_wait().await {
                 return Err(Error::ExitedImmediately {
                     code,
-                    stderr: "stderr движка на боевом пути не перехватывается; \
-                             диагностика — в check_prerequisites"
-                        .to_string(),
+                    stderr: instance.process.stderr_after_exit().await,
                 });
             }
             // std::fs, а не tokio::fs, и это осознанно. procfs — виртуальная
@@ -350,9 +347,7 @@ impl SystemNfqws2 {
                 return Err(Error::QueueNotBound {
                     queue: instance.queue.get(),
                     timeout_ms: READY_TIMEOUT_MS,
-                    stderr: "stderr движка на боевом пути не перехватывается; \
-                             диагностика — в check_prerequisites"
-                        .to_string(),
+                    stderr: instance.process.stderr_tail(),
                 });
             }
             tokio::time::sleep(Duration::from_millis(READY_POLL_MS)).await;
@@ -456,5 +451,62 @@ mod tests {
             matches!(result, Err(Error::LuaVersionMismatch { .. })),
             "{result:?}"
         );
+    }
+
+    async fn start_and_wait(script: &TempScript) -> Result<Ready, Error> {
+        let env = stub_env(script.0.clone());
+        let plan =
+            Plan::from_strategies(&FilterMark::granted(), QueueNum::new(64999), &[Vec::new()]);
+        let mut instance = SystemNfqws2::start(&env, &plan).await?;
+        let result = SystemNfqws2::wait_ready(&mut instance).await;
+        SystemNfqws2::stop(instance).await;
+        result
+    }
+
+    /// #95: на боевом пути движок падал с кодом 127, а в отчёт шла заглушка вместо его
+    /// слов — причину не видели ни мы, ни человек на роутере.
+    #[tokio::test]
+    async fn an_early_exit_on_the_battle_path_carries_the_engine_stderr() {
+        let script = write_stub_script(
+            "#!/bin/sh\n\
+             echo 'nfqws2: profile 1000: out of memory' >&2\n\
+             exit 127\n",
+        );
+        let result = start_and_wait(&script).await;
+        match result {
+            Err(Error::ExitedImmediately { code: 127, stderr }) => {
+                assert!(stderr.contains("profile 1000: out of memory"), "{stderr}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Живой движок, написавший в stderr больше ёмкости пайпа (64 КиБ), не должен
+    /// застревать на записи: перехват обязан вычерпывать пайп всё время жизни процесса.
+    /// Застрянь он — последняя строка не написалась бы и в хвост не попала.
+    #[tokio::test]
+    async fn a_chatty_engine_does_not_block_on_stderr_and_its_tail_is_reported() {
+        let script = write_stub_script(
+            "#!/bin/sh\n\
+             head -c 200000 /dev/zero | tr '\\0' x >&2\n\
+             echo >&2\n\
+             echo 'last words before hanging' >&2\n\
+             exec sleep 30\n",
+        );
+        let result = start_and_wait(&script).await;
+        match result {
+            Err(Error::QueueNotBound { stderr, .. }) => {
+                assert!(
+                    stderr.ends_with("last words before hanging"),
+                    "{stderr:.200}"
+                );
+                assert!(
+                    stderr.len() <= 4096,
+                    "хвост, а не весь поток: {}",
+                    stderr.len()
+                );
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

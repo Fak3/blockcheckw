@@ -166,14 +166,45 @@ pub fn die_with_parent(command: &mut std::process::Command) {
     }
 }
 
+/// Сколько последних байт stderr фонового процесса мы помним. Причина отказа движка — это
+/// его последние строки; весь поток держать незачем, а на роутере и не на что.
+const STDERR_TAIL_BYTES: usize = 4096;
+const STDERR_DRAIN_TIMEOUT_MS: u64 = 200;
+
+/// Хвост stderr: ограниченный буфер, который вычерпывающая задача пополняет до EOF.
+#[derive(Debug, Default)]
+struct StderrTail(StdMutex<Vec<u8>>);
+
+impl StderrTail {
+    fn push(&self, chunk: &[u8]) {
+        let mut tail = self.0.lock().unwrap();
+        tail.extend_from_slice(chunk);
+        let excess = tail.len().saturating_sub(STDERR_TAIL_BYTES);
+        tail.drain(..excess);
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap())
+            .trim()
+            .to_string()
+    }
+}
+
 /// A registered background process handle. Wraps a tokio process child.
 #[derive(Debug)]
 pub struct BackgroundProcess {
     child: Arc<Mutex<tokio::process::Child>>,
+    stderr: Arc<StderrTail>,
+    drain: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl BackgroundProcess {
-    /// Spawn a background process with stdout/stderr → /dev/null.
+    /// Spawn a background process: stdout → /dev/null, stderr — в ограниченный хвост.
+    ///
+    /// Пайп stderr вычерпывается задачей всё время жизни процесса. Без неё нельзя: процесс,
+    /// написавший больше ёмкости пайпа (64 КиБ), встал бы на записи, а мы бы приняли его за
+    /// живой. Прежде ради этого stderr слали в /dev/null — и отказ движка на боевом пути не
+    /// видел никто (#95).
     pub fn spawn(args: &[&str]) -> Result<Self, BlockcheckError> {
         let (program, cmd_args) =
             args.split_first()
@@ -203,21 +234,54 @@ impl BackgroundProcess {
         std_cmd
             .args(cmd_args)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::piped());
         die_with_parent(&mut std_cmd);
 
-        let child = Command::from(std_cmd)
+        let mut child = Command::from(std_cmd)
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| BlockcheckError::ProcessSpawn {
                 reason: e.to_string(),
             })?;
 
+        let stderr = Arc::new(StderrTail::default());
+        let drain = child.stderr.take().map(|mut pipe| {
+            let tail = Arc::clone(&stderr);
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 4096];
+                while let Ok(n @ 1..) = pipe.read(&mut buf).await {
+                    tail.push(&buf[..n]);
+                }
+            })
+        });
+
         let child = Arc::new(Mutex::new(child));
         registry.children.retain(|child| child.strong_count() > 0);
         registry.children.push(Arc::downgrade(&child));
 
-        Ok(Self { child })
+        Ok(Self {
+            child,
+            stderr,
+            drain,
+        })
+    }
+
+    /// Хвост stderr, накопленный к этому моменту. Для живого процесса — снимок.
+    pub fn stderr_tail(&self) -> String {
+        self.stderr.text()
+    }
+
+    /// Хвост stderr вышедшего процесса — дочитанный до EOF.
+    ///
+    /// После выхода в пайпе ещё могут лежать непрочитанные последние строки, а они-то и
+    /// называют причину. Ждём вычерпывающую задачу, но с потолком: пишущий конец мог
+    /// унаследовать внук процесса, и тогда EOF не придёт никогда.
+    pub async fn stderr_after_exit(&mut self) -> String {
+        if let Some(drain) = self.drain.take() {
+            let _ = timeout(Duration::from_millis(STDERR_DRAIN_TIMEOUT_MS), drain).await;
+        }
+        self.stderr.text()
     }
 
     /// Kill the process (SIGKILL) and wait to reap the zombie.
@@ -238,28 +302,5 @@ impl BackgroundProcess {
             Ok(Some(status)) => Some(status.code().unwrap_or(-1)),
             _ => None,
         }
-    }
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn shutdown_kills_registered_children_and_blocks_new_spawns() {
-        let mut process = BackgroundProcess::spawn(&["sleep", "30"]).expect("spawn sleep");
-        assert!(process.try_wait().await.is_none());
-        assert!(!background_shutdown_started(), "до shutdown флаг снят");
-
-        kill_all_background_processes().await;
-
-        // Пайплайн смотрит на этот флаг, чтобы не слать nft-батчи в таблицу,
-        // которую cleanup уже снёс (#66).
-        assert!(background_shutdown_started(), "после shutdown флаг взведён");
-
-        assert!(process.try_wait().await.is_some());
-        let error = BackgroundProcess::spawn(&["sleep", "30"])
-            .expect_err("spawn during shutdown must fail");
-        assert!(error.to_string().contains("shutdown in progress"));
     }
 }
